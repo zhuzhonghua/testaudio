@@ -1,0 +1,6 @@
+
+TARGET = testaudiorecording
+
+$(TARGET):$(TARGET).cpp
+	g++ -o $(TARGET) $(TARGET).cpp  -g -O0 -lavformat -lavcodec -lswscale -lswresample -lavutil -lz -lm `sdl2-config --cflags --libs` -lSDL2_mixer -lSDL2_image -lSDL2_ttf
+
