@@ -34,6 +34,9 @@ AVFrame wanted_frame;
 PacketQueue audioq;
 int quit = 0;
 
+SDL_mutex* texMutex;
+SDL_Texture* tex;
+SDL_Renderer* renderer;
 
 void packet_queue_init(PacketQueue *q)
 {
@@ -55,7 +58,7 @@ int packet_queue_put(PacketQueue *q, AVPacket *pkt)
   q->size += pkt->size;
   SDL_CondSignal(q->cond);
   
-  SDL_Log("queue size %d\n", q->pkt.size());
+  //SDL_Log("queue size %d\n", q->pkt.size());
 
   SDL_UnlockMutex(q->mutex);
   return 0;
@@ -168,6 +171,7 @@ int audio_decode_frame(AVCodecContext *aCodecCtx, uint8_t *audio_buf, int buf_si
 
 void audio_callback(void *user_data, Uint8 *stream, int len)
 {
+	printf("callback tick %d\n", SDL_GetTicks());
 	AVCodecContext *aCodecCtx = (AVCodecContext *)user_data;
 
 	static uint8_t audio_buf[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
@@ -196,9 +200,24 @@ void audio_callback(void *user_data, Uint8 *stream, int len)
 		
 		SDL_MixAudioFormat(stream, (uint8_t *)audio_buf + audio_buf_index, AUDIO_S16SYS, len, SDL_MIX_MAXVOLUME);
 		
+    SDL_LockMutex(texMutex);    
+    SDL_SetRenderTarget(renderer, tex);
+    SDL_SetRenderDrawColor( renderer, 0x00, 0xFF, 0x00, 0xFF );
+    Uint8 *bufRender = audio_buf + audio_buf_index;
+    Uint8 maxLen = sizeof(audio_buf) - audio_buf_index;
+    for (int i = 0; i < len && i < maxLen; i++)
+    {
+			SDL_Rect fillRect = { 0, 0, 1, bufRender[i]};  		
+  		SDL_RenderFillRect( renderer, &fillRect );	
+    }
+    
+		SDL_SetRenderTarget(renderer, NULL);
+    SDL_UnlockMutex(texMutex);
+
     len -= len1;
     stream += len1;
     audio_buf_index += len1;
+
   }
 }
 
@@ -218,9 +237,7 @@ int main(int argc, char *argv[])
 			exit(1);
 	}
 
-	SDL_Renderer 		*renderer;
 	SDL_Window 			*window;
-
 	// Make a screen to put our video
 	window = SDL_CreateWindow(
 					"testaudio",
@@ -232,6 +249,15 @@ int main(int argc, char *argv[])
 			);
 
 	renderer = SDL_CreateRenderer(window, -1, 0);
+
+	tex = SDL_CreateTexture(renderer,SDL_PIXELFORMAT_RGBA8888,SDL_TEXTUREACCESS_TARGET,640,400);
+	texMutex = SDL_CreateMutex();
+
+	SDL_SetRenderTarget(renderer, tex);
+	SDL_Rect fillRect = { 0, 0, 100, 100 };
+  SDL_SetRenderDrawColor( renderer, 0xFF, 0x00, 0x00, 0xFF );        
+  SDL_RenderFillRect( renderer, &fillRect );
+	SDL_SetRenderTarget(renderer, NULL);
 
 	AVFormatContext *pFormatCtx = NULL;
 	AVPacket 				packet;
@@ -283,6 +309,7 @@ int main(int argc, char *argv[])
 		SDL_LogError(SDL_LOG_CATEGORY_AUDIO, "Failed to open audio: %s", SDL_GetError());
   if(want.format != have.format) SDL_LogError(SDL_LOG_CATEGORY_AUDIO, "Failed to get the desired AudioSpec");
 
+  SDL_Log("want freq %d sample %d, have freq %d sample %d\n", want.freq, want.samples, have.freq, have.samples);
 
 	//设置参数，供解码时候用, swr_alloc_set_opts的in部分参数
   wanted_frame.format         = AV_SAMPLE_FMT_S16;
@@ -296,6 +323,7 @@ int main(int argc, char *argv[])
   packet_queue_init(&audioq);
 
   SDL_PauseAudioDevice(dev, 0);; // start playing sound
+
 
   while(!quit) 
   {
@@ -325,7 +353,18 @@ int main(int argc, char *argv[])
 			}
   	}
   	
-		//SDL_Delay(10);
+  	SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255);
+		SDL_RenderClear(renderer);
+
+		SDL_LockMutex(texMutex);
+    
+		SDL_Rect dest = { 0, 100, 640, 400 };
+		SDL_RenderCopy(renderer, tex, NULL, &dest);
+		SDL_UnlockMutex(texMutex);
+
+    SDL_RenderPresent(renderer);
+
+		SDL_Delay(10);
   }
 
 	SDL_Log("app quit tick %d\n", SDL_GetTicks());
