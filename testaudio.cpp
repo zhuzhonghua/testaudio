@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <vector>
+#include <time.h>
 
 extern "C"
 {
@@ -19,24 +20,111 @@ extern "C"
 const int AMPLITUDE = 28000;
 const int SAMPLE_RATE = 44100;
 #define MAX_AUDIO_FRAME_SIZE 192000
+SDL_Texture* tex;
+SDL_Renderer* renderer;
+
+int audio_decode_frame_private(AVCodecContext *aCodecCtx, AVPacket* packet, uint8_t *audio_buf, int buf_size);
+
+class SamplesQueue{
+public:
+	SDL_mutex *mutex;
+	SDL_cond *cond;
+	std::vector<std::vector<short> > samples;
+
+	SamplesQueue()
+	{
+		mutex = SDL_CreateMutex();
+  	cond = SDL_CreateCond();
+	}
+
+	int put_packet(AVCodecContext *aCodecCtx, AVPacket *packet)
+	{
+		if(av_dup_packet(packet) < 0) {
+    	return -1;
+	  }
+	    
+	  SDL_LockMutex(mutex);
+
+	  uint8_t audio_buf[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
+		unsigned int audio_buf_size = 0;
+  	unsigned int audio_buf_index = 0;
+  	audio_buf_size = audio_decode_frame_private(aCodecCtx, packet, audio_buf, sizeof(audio_buf));
+
+  	short* samples_data = (short*)audio_buf;
+  	int samples_len = audio_buf_size / 2;
+  	samples.emplace_back(samples_data, samples_data+samples_len);
+
+	  SDL_CondSignal(cond);
+
+	  SDL_UnlockMutex(mutex);
+
+	  //render(samples_data, samples_len);
+	  return 0;
+	}
+
+	int get_sample(uint8_t* buf, int size)
+	{
+		SDL_LockMutex(mutex);
+		if (samples.size() <= 0)
+		{
+			SDL_CondWait(cond, mutex);
+		}
+		std::vector<short> sample_data = samples.front();
+		int len = sample_data.size()*sizeof(short);
+		memcpy(buf, sample_data.data(), len);
+		samples.erase(samples.begin());
+		SDL_UnlockMutex(mutex);
+
+		return len;
+	}
+
+	void render(short* samples_data, int samples_len)
+	{
+		static int x = 0;
+		static int y = 0;
+		const int H = 200;
+
+		SDL_SetRenderTarget(renderer, tex);
+		SDL_SetRenderDrawColor( renderer, 0x00, 0xFF, 0xFF, 0xFF );
+	  for (int i = 0; i < samples_len; i++)
+	  {
+	  	short one_sample = samples_data[i];
+	  	
+	  	int sampleH = ((float)one_sample / 32768.0f)*H;
+	  	//SDL_Log("render sampleH %d one_sample %d\n", sampleH, one_sample);
+	  	if (sampleH > 0) 
+	  	{		  	
+				SDL_Rect fillRect = { x++, y+(H - sampleH)/2, 1, sampleH};  
+		  	SDL_RenderFillRect( renderer, &fillRect );		
+	  	}
+	
+	  	if (x >= 480)
+	  	{
+	  		x = 0;
+	  		y += H;
+	  	}
+	  }
+
+		SDL_SetRenderTarget(renderer, NULL);		
+	}
+};
 
 
 struct PacketQueue {
-	std::vector<AVPacket> pkt;  
+	std::vector<AVPacket> pkt;
+
   int size;
   SDL_mutex *mutex;
   SDL_cond *cond;
 };
 
-
-
 AVFrame wanted_frame;
 PacketQueue audioq;
+SamplesQueue samplesq;
 int quit = 0;
 
 SDL_mutex* texMutex;
-SDL_Texture* tex;
-SDL_Renderer* renderer;
+
 
 void packet_queue_init(PacketQueue *q)
 {
@@ -56,6 +144,8 @@ int packet_queue_put(PacketQueue *q, AVPacket *pkt)
   
   q->pkt.push_back(*pkt);  
   q->size += pkt->size;
+
+
   SDL_CondSignal(q->cond);
   
   //SDL_Log("queue size %d\n", q->pkt.size());
@@ -94,27 +184,21 @@ static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block)
   return ret;
 }
 
-int audio_decode_frame(AVCodecContext *aCodecCtx, uint8_t *audio_buf, int buf_size) 
+
+int audio_decode_frame_private(AVCodecContext *aCodecCtx, AVPacket* packet, uint8_t *audio_buf, int buf_size)
 {
-	AVPacket   packet;
 
   SwrContext *swr_ctx = NULL;
   int        	convert_all = 0;
   int 				audio_buf_index = 0;
 
-  if (packet_queue_get(&audioq, &packet, 1) < 0)
-  {
-		assert(0);
-		return -1;
-  }
-
   // TO delete av_frame_free(&frame);
 	AVFrame* frame = av_frame_alloc();
-  int pkt_size = packet.size;
+  int pkt_size = packet->size;
   while(pkt_size > 0)
   {
   	int got_frame = 0;
-  	int decode_len = avcodec_decode_audio4(aCodecCtx, frame, &got_frame, &packet);
+  	int decode_len = avcodec_decode_audio4(aCodecCtx, frame, &got_frame, packet);
   	if (decode_len < 0) //解码出错
   	{
   		assert(0);
@@ -169,9 +253,106 @@ int audio_decode_frame(AVCodecContext *aCodecCtx, uint8_t *audio_buf, int buf_si
   return wanted_frame.channels * convert_all * av_get_bytes_per_sample((AVSampleFormat)wanted_frame.format);
 }
 
+
+void render_to_tex(AVCodecContext *aCodecCtx, AVPacket* pkt)
+{
+	static int x = 0;
+	static int y = 0;
+	const int H = 20;
+
+	//AVPacket packet = *pkt;
+//
+	//uint8_t audio_buf[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
+	//unsigned int audio_buf_size = 0;
+  //unsigned int audio_buf_index = 0;
+  //audio_buf_size = audio_decode_frame_private(aCodecCtx, &packet, audio_buf, sizeof(audio_buf));
+//
+  //short* samples = (short*)audio_buf;
+  //int samples_len = audio_buf_size / 2;
+//
+//
+	SDL_SetRenderTarget(renderer, tex);
+	SDL_SetRenderDrawColor( renderer, 0x00, 0x00, 0xFF, 0xFF );
+	for (int i = 0; i < 500; i++)
+	{
+		int sampleH = rand()%20;
+		SDL_Rect fillRect = { x++, y+(20 - sampleH)/2, 1, rand()%20};
+  	SDL_RenderFillRect( renderer, &fillRect );	
+
+  	if (x >= 640)
+  	{
+  		x = 0;
+  		y += H;
+  	}
+	}
+  //for (int i = 0; i < samples_len; i++)
+  //{
+  //	short one_sample = samples[i];
+  //	int sampleH = (one_sample / 32768.0f)*H;
+  //	SDL_Rect fillRect = { x++, y, 1, sampleH};  
+  //	SDL_RenderFillRect( renderer, &fillRect );	
+//
+  //	if (x >= 480)
+  //	{
+  //		x = 0;
+  //		y += H;
+  //	}
+  //}
+
+	SDL_SetRenderTarget(renderer, NULL);
+}
+
+int audio_decode_frame(AVCodecContext *aCodecCtx, uint8_t *audio_buf, int buf_size) 
+{
+	AVPacket   packet;
+
+  if (packet_queue_get(&audioq, &packet, 1) < 0)
+  {
+		assert(0);
+		return -1;
+  }
+  return audio_decode_frame_private(aCodecCtx, &packet, audio_buf, buf_size);
+}
+
+void audio_callback_new(void *user_data, Uint8 *stream, int len)
+{
+	static uint8_t audio_buf[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
+  static unsigned int audio_buf_size = 0;
+  static unsigned int audio_buf_index = 0;
+
+	SDL_memset(stream, 0, len);
+
+	while(len > 0) {
+  	if(audio_buf_index >= audio_buf_size) {
+  		//samplesq.get_sample(audio_buf, sizeof(audio_buf));
+      /* We have already sent all our data; get more */
+      int audio_size = samplesq.get_sample(audio_buf, sizeof(audio_buf)); //audio_decode_frame(aCodecCtx, audio_buf, sizeof(audio_buf));
+      if(audio_size < 0) {
+      	assert(0);
+				/* If error, output silence */
+				audio_buf_size = 1024; // arbitrary?
+				memset(audio_buf, 0, audio_buf_size);
+      } else {
+				audio_buf_size = audio_size;
+      }
+      audio_buf_index = 0;
+    }
+    int len1 = audio_buf_size - audio_buf_index;
+    if(len1 > len)
+      len1 = len;
+		
+		SDL_MixAudioFormat(stream, (uint8_t *)audio_buf + audio_buf_index, AUDIO_S16SYS, len, SDL_MIX_MAXVOLUME);	
+
+    len -= len1;
+    stream += len1;
+    audio_buf_index += len1;
+
+  }
+}
+
 void audio_callback(void *user_data, Uint8 *stream, int len)
 {
-	printf("callback tick %d\n", SDL_GetTicks());
+	//printf("callback tick %d\n", SDL_GetTicks());
 	AVCodecContext *aCodecCtx = (AVCodecContext *)user_data;
 
 	static uint8_t audio_buf[(MAX_AUDIO_FRAME_SIZE * 3) / 2];
@@ -198,21 +379,7 @@ void audio_callback(void *user_data, Uint8 *stream, int len)
     if(len1 > len)
       len1 = len;
 		
-		SDL_MixAudioFormat(stream, (uint8_t *)audio_buf + audio_buf_index, AUDIO_S16SYS, len, SDL_MIX_MAXVOLUME);
-		
-    SDL_LockMutex(texMutex);    
-    SDL_SetRenderTarget(renderer, tex);
-    SDL_SetRenderDrawColor( renderer, 0x00, 0xFF, 0x00, 0xFF );
-    Uint8 *bufRender = audio_buf + audio_buf_index;
-    Uint8 maxLen = sizeof(audio_buf) - audio_buf_index;
-    for (int i = 0; i < len && i < maxLen; i++)
-    {
-			SDL_Rect fillRect = { 0, 0, 1, bufRender[i]};  		
-  		SDL_RenderFillRect( renderer, &fillRect );	
-    }
-    
-		SDL_SetRenderTarget(renderer, NULL);
-    SDL_UnlockMutex(texMutex);
+		SDL_MixAudioFormat(stream, (uint8_t *)audio_buf + audio_buf_index, AUDIO_S16SYS, len, SDL_MIX_MAXVOLUME);	
 
     len -= len1;
     stream += len1;
@@ -229,6 +396,7 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
+	srand (time(NULL));
 	// Register all formats and codecs
 	av_register_all();
 
@@ -250,14 +418,14 @@ int main(int argc, char *argv[])
 
 	renderer = SDL_CreateRenderer(window, -1, 0);
 
-	tex = SDL_CreateTexture(renderer,SDL_PIXELFORMAT_RGBA8888,SDL_TEXTUREACCESS_TARGET,640,400);
+	tex = SDL_CreateTexture(renderer,SDL_PIXELFORMAT_RGBA8888,SDL_TEXTUREACCESS_TARGET,640,480);
 	texMutex = SDL_CreateMutex();
 
-	SDL_SetRenderTarget(renderer, tex);
-	SDL_Rect fillRect = { 0, 0, 100, 100 };
-  SDL_SetRenderDrawColor( renderer, 0xFF, 0x00, 0x00, 0xFF );        
-  SDL_RenderFillRect( renderer, &fillRect );
-	SDL_SetRenderTarget(renderer, NULL);
+	//SDL_SetRenderTarget(renderer, tex);
+	//SDL_Rect fillRect = { 0, 0, 100, 100 };
+  //SDL_SetRenderDrawColor( renderer, 0xFF, 0x00, 0x00, 0xFF );        
+  //SDL_RenderFillRect( renderer, &fillRect );
+	//SDL_SetRenderTarget(renderer, NULL);
 
 	AVFormatContext *pFormatCtx = NULL;
 	AVPacket 				packet;
@@ -300,7 +468,7 @@ int main(int argc, char *argv[])
   want.channels = aCodecCtx->channels; // only one channel
   want.silence = 0;
   want.samples = SDL_AUDIO_BUFFER_SIZE; // buffer-size
-  want.callback = audio_callback; // function SDL calls periodically to refill the buffer
+  want.callback = audio_callback_new; // function SDL calls periodically to refill the buffer
   want.userdata = aCodecCtx; // counter, keeping track of current sample number
 
   SDL_AudioSpec have;
@@ -313,14 +481,14 @@ int main(int argc, char *argv[])
 
 	//设置参数，供解码时候用, swr_alloc_set_opts的in部分参数
   wanted_frame.format         = AV_SAMPLE_FMT_S16;
-  wanted_frame.sample_rate    = have.freq;
+  wanted_frame.sample_rate    = have.freq / 2;
   wanted_frame.channel_layout = av_get_default_channel_layout(have.channels);
   wanted_frame.channels       = have.channels;
 
 	avcodec_open2(aCodecCtx, aCodec, NULL);
 	
 	// audio_st = pFormatCtx->streams[index]
-  packet_queue_init(&audioq);
+  //packet_queue_init(&audioq);
 
   SDL_PauseAudioDevice(dev, 0);; // start playing sound
 
@@ -331,7 +499,9 @@ int main(int argc, char *argv[])
   	{
   		if(packet.stream_index == audioStream) 
 	  	{
-	  		packet_queue_put(&audioq, &packet);
+	  		//packet_queue_put(&audioq, &packet);
+	  		//render_to_tex(aCodecCtx, &packet);
+	  		samplesq.put_packet(aCodecCtx, &packet);
 	  	}
 	  	else
 	  	{
@@ -356,11 +526,7 @@ int main(int argc, char *argv[])
   	SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255);
 		SDL_RenderClear(renderer);
 
-		SDL_LockMutex(texMutex);
-    
-		SDL_Rect dest = { 0, 100, 640, 400 };
-		SDL_RenderCopy(renderer, tex, NULL, &dest);
-		SDL_UnlockMutex(texMutex);
+		SDL_RenderCopy(renderer, tex, NULL, NULL);
 
     SDL_RenderPresent(renderer);
 
